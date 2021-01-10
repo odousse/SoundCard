@@ -1,7 +1,9 @@
+import asyncio
 import os
 import cffi
 import numpy
 import collections
+import queue
 import time
 import re
 import math
@@ -314,9 +316,11 @@ class _Player:
 
     def __init__(self, id, samplerate, channels, blocksize=None):
         self._au = _AudioUnit("output", id, samplerate, channels, blocksize)
+        self._queue = collections.deque()
+        self._done = threading.Event()
+        self.n_errors = 0
 
     def __enter__(self):
-        self._queue = collections.deque()
 
         @_ffi.callback("AURenderCallback")
         def render_callback(userdata, actionflags, timestamp,
@@ -329,6 +333,12 @@ class _Player:
                 while bytes_written < to_write:
                     if self._queue:
                         data = self._queue.popleft()
+                        if data is None:  # end marker
+                            # finished playing
+                            self._done.set()
+                            src = bytearray(to_write - bytes_written)
+                            _ffi.memmove(dest.mData + bytes_written, src, len(src))
+                            break
                         srcbuffer = _ffi.from_buffer(data)
                         numbytes = min(len(srcbuffer), to_write-bytes_written)
                         _ffi.memmove(dest.mData+bytes_written, srcbuffer, numbytes)
@@ -337,9 +347,12 @@ class _Player:
                             self._queue.appendleft(leftover)
                         bytes_written += numbytes
                     else:
+                        # buffer unferflow
+                        if not self._done.is_set():
+                            self.n_errors += 1
                         src = bytearray(to_write-bytes_written)
                         _ffi.memmove(dest.mData+bytes_written, src, len(src))
-                        bytes_written += len(src)
+                        break
             return 0
 
         self._au.set_callback(render_callback)
@@ -349,6 +362,21 @@ class _Player:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self._au.close()
+
+    def _sanitize_data(self, data):
+        data = numpy.asarray(data, dtype="float32", order='C')
+        data[data > 1] = 1
+        data[data < -1] = -1
+        if data.ndim == 1:
+            data = data[:, None]  # force 2d
+        if data.ndim != 2:
+            raise TypeError('data must be 1d or 2d, not {}d'.format(data.ndim))
+        if data.shape[1] == 1 and self._au.channels != 1:
+            data = numpy.tile(data, [1, self._au.channels])
+        if data.shape[1] != self._au.channels:
+            raise TypeError(
+                'second dimension of data must be equal to the number of channels, not {}'.format(data.shape[1]))
+        return data
 
     def play(self, data, wait=True):
         """Play some audio data.
@@ -369,18 +397,7 @@ class _Player:
         will be queued up and played one after another.
 
         """
-
-        data = numpy.asarray(data, dtype="float32", order='C')
-        data[data>1] = 1
-        data[data<-1] = -1
-        if data.ndim == 1:
-            data = data[:, None] # force 2d
-        if data.ndim != 2:
-            raise TypeError('data must be 1d or 2d, not {}d'.format(data.ndim))
-        if data.shape[1] == 1 and self._au.channels != 1:
-            data = numpy.tile(data, [1, self._au.channels])
-        if data.shape[1] != self._au.channels:
-            raise TypeError('second dimension of data must be equal to the number of channels, not {}'.format(data.shape[1]))
+        data = self._sanitize_data(data)
         idx = 0
         while idx < len(data)-self._au.blocksize:
             self._queue.append(data[idx:idx+self._au.blocksize])
@@ -388,6 +405,39 @@ class _Player:
         self._queue.append(data[idx:])
         while self._queue and wait:
             time.sleep(0.001)
+
+    def add_chunk(self, data):
+        self.add_raw_chunk(self._sanitize_data(data))
+
+    def add_raw_chunk(self, data):
+        if data.dtype != numpy.float32:
+            raise TypeError(f'Wrong dtype {data.dtype} (should be float32)')
+        if numpy.isfortran(data):
+            raise TypeError('Data must be in C order')
+        if data.max() > 1 or data.min() < -1:
+            raise ValueError('Data must be between -1 and 1')
+        if data.ndim != 2:
+            raise TypeError('Data must be 2-dim array')
+        if data.shape[1] != self._au.channels:
+            raise TypeError(f'second dimension of data must be equal to the number of channels, not {data.shape[1]}')
+        self._queue.append(data)
+
+    def add_end_marker(self):
+        self._queue.append(None)
+
+    def play_all(self):
+        with self:
+            self._done.wait()
+
+    async def async_play_all(self):
+        loop = asyncio.get_event_loop()
+        done = asyncio.Event()
+        def play_routine():
+            self.play_all()
+            loop.call_soon_threadsafe(done.set)
+        threading.Thread(target=play_routine).start()
+        await done.wait()
+
 
 class _AudioUnit:
     """Communication helper with AudioUnits.
