@@ -582,6 +582,7 @@ class _Player(_AudioClient):
         self.n_errors = 0
         self._sample_rate = samplerate
         self._ppRenderClient = self._render_client()
+        self._started = False
 
     # https://msdn.microsoft.com/en-us/library/windows/desktop/dd316756(v=vs.85).aspx
     def _render_client(self):
@@ -607,6 +608,7 @@ class _Player(_AudioClient):
     def __enter__(self):
         hr = self._ptr[0][0].lpVtbl.Start(self._ptr[0])
         _com.check_error(hr)
+        self._started = True
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -614,6 +616,7 @@ class _Player(_AudioClient):
         _com.check_error(hr)
         _com.release(self._ppRenderClient)
         _com.release(self._ptr)
+        self._started = False
 
     def _sanitize_data(self, data):
         data = numpy.array(data, dtype='float32', order='C')
@@ -702,7 +705,7 @@ class _Player(_AudioClient):
             raise ValueError(f"Data chunk longer than buffer ({len(data)}, buffer is {buffer_size})")
         while True:
             padding = self.currentpadding
-            if padding == 0:
+            if self._started and padding == 0:
                 # buffer underflow
                 self.n_errors += 1
             missing = len(data) + padding - buffer_size
