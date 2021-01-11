@@ -578,9 +578,10 @@ class _Player(_AudioClient):
     """
     def __init__(self, ptr, samplerate, channels, blocksize, isloopback, exclusive_mode=False):
         super().__init__(ptr, samplerate, channels, blocksize, isloopback, exclusive_mode)
-        self._queue = queue.queue()
+        self._queue = queue.Queue()
         self.n_errors = 0
         self._sample_rate = samplerate
+        self._ppRenderClient = self._render_client()
 
     # https://msdn.microsoft.com/en-us/library/windows/desktop/dd316756(v=vs.85).aspx
     def _render_client(self):
@@ -604,7 +605,6 @@ class _Player(_AudioClient):
         return self.buffersize-self.currentpadding
 
     def __enter__(self):
-        self._ppRenderClient = self._render_client()
         hr = self._ptr[0][0].lpVtbl.Start(self._ptr[0])
         _com.check_error(hr)
         return self
@@ -705,7 +705,7 @@ class _Player(_AudioClient):
             if padding == 0:
                 # buffer underflow
                 self.n_errors += 1
-            missing = buffer_size - padding - len(data)
+            missing = len(data) + padding - buffer_size
             if missing > 0:
                 time.sleep(missing / self._sample_rate)
             else:
@@ -714,12 +714,13 @@ class _Player(_AudioClient):
         bytes = data.ravel().tostring()
         buffer = self._render_buffer(len(data))
         _ffi.memmove(buffer[0], bytes, len(bytes))
-        self._render_release(towrite)
+        self._render_release(len(data))
 
     def _wait_until_data_played(self):
         padding = self.currentpadding
         while  padding > 0:
             time.sleep(padding / self._sample_rate)
+            padding = self.currentpadding
 
     async def async_play_all(self):
         loop = asyncio.get_event_loop()
