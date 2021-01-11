@@ -4,9 +4,11 @@ import os
 import cffi
 import numpy
 import time
+import queue
 import re
 import collections
 import platform
+import threading
 
 _ffi = cffi.FFI()
 _package_dir, _ = os.path.split(__file__)
@@ -574,6 +576,11 @@ class _Player(_AudioClient):
     after it is closed.
 
     """
+    def __init__(self, ptr, samplerate, channels, blocksize, isloopback, exclusive_mode=False):
+        super().__init__(ptr, samplerate, channels, blocksize, isloopback, exclusive_mode)
+        self._queue = queue.queue()
+        self.n_errors = 0
+        self._sample_rate = samplerate
 
     # https://msdn.microsoft.com/en-us/library/windows/desktop/dd316756(v=vs.85).aspx
     def _render_client(self):
@@ -608,6 +615,19 @@ class _Player(_AudioClient):
         _com.release(self._ppRenderClient)
         _com.release(self._ptr)
 
+    def _sanitize_data(self, data):
+        data = numpy.array(data, dtype='float32', order='C')
+        if data.ndim == 1:
+            data = data[:, None]  # force 2d
+        if data.ndim != 2:
+            raise TypeError('data must be 1d or 2d, not {}d'.format(data.ndim))
+        if data.shape[1] == 1 and len(set(self.channelmap)) != 1:
+            data = numpy.tile(data, [1, len(set(self.channelmap))])
+
+        # internally, channel numbers are always ascending:
+        sortidx = sorted(range(len(self.channelmap)), key=lambda k: self.channelmap[k])
+        return data[:, sortidx]
+
     def play(self, data):
         """Play some audio data.
 
@@ -628,17 +648,7 @@ class _Player(_AudioClient):
 
         """
 
-        data = numpy.array(data, dtype='float32', order='C')
-        if data.ndim == 1:
-            data = data[:, None] # force 2d
-        if data.ndim != 2:
-            raise TypeError('data must be 1d or 2d, not {}d'.format(data.ndim))
-        if data.shape[1] == 1 and len(set(self.channelmap)) != 1:
-            data = numpy.tile(data, [1, len(set(self.channelmap))])
-
-        # internally, channel numbers are always ascending:
-        sortidx = sorted(range(len(self.channelmap)), key=lambda k: self.channelmap[k])
-        data = data[:, sortidx]
+        data = self._sanitize_data(data)
 
         if data.shape[1] != len(set(self.channelmap)):
             raise TypeError('second dimension of data must be equal to the number of channels, not {}'.format(data.shape[1]))
@@ -653,6 +663,72 @@ class _Player(_AudioClient):
             _ffi.memmove(buffer[0], bytes, len(bytes))
             self._render_release(towrite)
             data = data[towrite:]
+
+    def add_chunk(self, data):
+        self.add_raw_chunk(self._sanitize_data(data))
+
+    def add_raw_chunk(self, data):
+        if data.dtype != numpy.float32:
+            raise TypeError(f'Wrong dtype {data.dtype} (should be float32)')
+        if numpy.isfortran(data):
+            raise TypeError('Data must be in C order')
+        if data.max() > 1 or data.min() < -1:
+            raise ValueError('Data must be between -1 and 1')
+        if data.ndim != 2:
+            raise TypeError('Data must be 2-dim array')
+        if data.shape[1] != len(set(self.channelmap)):
+            raise TypeError(f'second dimension of data must be equal to the number of channels, not {data.shape[1]}')
+        self._queue.put_nowait(data)
+
+    def add_end_marker(self):
+        self._queue.put_nowait(None)
+
+    def play_all(self):
+        data = self._queue.get()
+        if data is None:  # no audio to play, return
+            return
+        self._add_data_to_buffer(data)
+        with self:
+            while True:
+                data = self._queue.get()
+                if data is None:
+                    self._wait_until_data_played()
+                    break
+                self._add_data_to_buffer(data)
+
+    def _add_data_to_buffer(self, data):
+        buffer_size = self.buffersize
+        if len(data) > buffer_size:
+            raise ValueError(f"Data chunk longer than buffer ({len(data)}, buffer is {buffer_size})")
+        while True:
+            padding = self.currentpadding
+            if padding == 0:
+                # buffer underflow
+                self.n_errors += 1
+            missing = buffer_size - padding - len(data)
+            if missing > 0:
+                time.sleep(missing / self._sample_rate)
+            else:
+                break
+
+        bytes = data.ravel().tostring()
+        buffer = self._render_buffer(len(data))
+        _ffi.memmove(buffer[0], bytes, len(bytes))
+        self._render_release(towrite)
+
+    def _wait_until_data_played(self):
+        padding = self.currentpadding
+        while  padding > 0:
+            time.sleep(padding / self._sample_rate)
+
+    async def async_play_all(self):
+        loop = asyncio.get_event_loop()
+        done = asyncio.Event()
+        def play_routine():
+            self.play_all()
+            loop.call_soon_threadsafe(done.set)
+        threading.Thread(target=play_routine).start()
+        await done.wait()
 
 class _Recorder(_AudioClient):
     """A context manager for an active input stream.
