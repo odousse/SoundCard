@@ -425,9 +425,15 @@ class _Player:
     def add_end_marker(self):
         self._queue.append(None)
 
+    def prepare_play(self):
+        pass
+
+    def complete_play(self):
+        self._done.wait()
+
     def play_all(self):
         with self:
-            self._done.wait()
+           self.complete_play()
 
     async def async_play_all(self):
         loop = asyncio.get_event_loop()

@@ -686,18 +686,24 @@ class _Player(_AudioClient):
     def add_end_marker(self):
         self._queue.put_nowait(None)
 
-    def play_all(self):
+    def prepare_play(self):
         data = self._queue.get()
         if data is None:  # no audio to play, return
             return
         self._add_data_to_buffer(data)
+
+    def complete_play(self):
+        while True:
+            data = self._queue.get()
+            if data is None:
+                self._wait_until_data_played()
+                break
+            self._add_data_to_buffer(data)
+
+    def play_all(self):
+        self.prepare_play()
         with self:
-            while True:
-                data = self._queue.get()
-                if data is None:
-                    self._wait_until_data_played()
-                    break
-                self._add_data_to_buffer(data)
+            self.complete_play()
 
     def _add_data_to_buffer(self, data):
         buffer_size = self.buffersize
