@@ -709,6 +709,19 @@ class _Player(_Stream):
         _pulse._pa_stream_connect_playback(self.stream, self._id.encode(), bufattr, _pa.PA_STREAM_ADJUST_LATENCY,
                                                 _ffi.NULL, _ffi.NULL)
 
+    def _sanitize_data(self, data):
+        data = numpy.array(data, dtype='float32', order='C')
+        if data.ndim == 1:
+            data = data[:, None]  # force 2d
+        if data.ndim != 2:
+            raise TypeError('data must be 1d or 2d, not {}d'.format(data.ndim))
+        if data.shape[1] == 1 and self.channels != 1:
+            data = numpy.tile(data, [1, self.channels])
+        if data.shape[1] != self.channels:
+            raise TypeError(
+                'second dimension of data must be equal to the number of channels, not {}'.format(data.shape[1]))
+
+
     def play(self, data):
         """Play some audio data.
 
